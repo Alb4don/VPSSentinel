@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vps_sentinel.py"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "vps_sentinel.py"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lint tooling
+        run: pip install --disable-pip-version-check pyflakes
+
+      - name: Byte-compile check
+        run: python -m py_compile vps_sentinel.py
+
+      - name: pyflakes
+        run: python -m pyflakes vps_sentinel.py
+
+  smoke-test:
+    name: Smoke Test (${{ matrix.os }}, Python ${{ matrix.python-version }}, psutil=${{ matrix.with-psutil }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.8", "3.10", "3.12"]
+        with-psutil: [true, false]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install psutil
+        if: matrix.with-psutil == true
+        run: pip install --disable-pip-version-check psutil
+
+      - name: Show help
+        run: python vps_sentinel.py --help
+
+      - name: Run quick audit (JSON)
+        shell: bash
+        run: |
+          python vps_sentinel.py --quick --json --no-color > report.json || true
+          python - <<'PY'
+          import json
+          with open("report.json", "r", encoding="utf-8") as handle:
+              data = json.load(handle)
+          assert data["tool"] == "VPS SENTINEL"
+          assert isinstance(data["score"], int)
+          assert isinstance(data["findings"], list) and data["findings"]
+          print(f"OK: score={data['score']} findings={len(data['findings'])}")
+          PY
+
+      - name: Run quick audit (formatted report)
+        shell: bash
+        run: python vps_sentinel.py --quick --no-color --no-banner || true
+
+      - name: Validate --output file export
+        shell: bash
+        run: |
+          python vps_sentinel.py --quick --no-color --no-banner --output "$RUNNER_TEMP/vps_sentinel_report.json" || true
+          test -s "$RUNNER_TEMP/vps_sentinel_report.json"
+
+      - name: Reject invalid --output path
+        shell: bash
+        run: |
+          set +e
+          python vps_sentinel.py --quick --output "/path/does/not/exist/report.json"
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "Expected exit code 2 for invalid output path, got $status"
+            exit 1
+          fi
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-sentinel-report-${{ matrix.os }}-py${{ matrix.python-version }}-psutil${{ matrix.with-psutil }}
+          path: report.json
+          retention-days: 7
